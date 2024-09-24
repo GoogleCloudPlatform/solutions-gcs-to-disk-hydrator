@@ -1,0 +1,247 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Hydrate a PD disk/path in zone from a GCS bucket/path
+# input:
+#   {
+#      "bucket":      "bucket name",
+#      "bucket-path": "bucket path"
+#      "zone":        "pd disk zone"
+#      "pd-name":     "pd disk name"
+#      "pd-path":     "path within pd"
+#   }
+main:
+  params: [input]
+  steps:
+    - variables:
+        assign:
+          - bucket: "${input.bucket}" # TODO: use map.get
+          - bucket_path: "${input.bucketPath}"
+          - zone: "${input.zone}"
+          - pd_name: "${input.pdName}"
+          - pd_path: '${text.replace_all_regex(input.pdPath, "^[/.]+", "")}'
+          - project: '${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}'
+          - disk: ${disks_get(pd_name, project, zone)}
+          - uuid: ${uuid.generate()}
+          - pool: null
+          - vm: null
+          - sts_job: null
+          - sts_operation: null
+          - status:
+              code: 200
+              message: "OK"
+    - check_disk:
+        switch:
+          - condition: ${"users" in disk and len(disk.users) > 0}
+            steps:
+              - disk_attached:
+                  assign:
+                    - status:
+                        code: 409
+                        message: "Disk is already attached"
+                  next: do_exit
+          - condition: ${disk.status != "READY"}
+            steps:
+              - disk_not_ready:
+                  assign:
+                    - status:
+                        code: 409
+                        message: "Disk status is not READY"
+                  next: do_exit
+    - create_sts_pool:
+        try:
+          call: http.post
+          args:
+            url: ${"https://storagetransfer.googleapis.com/v1/projects/" + project + "/agentPools" }
+            query:
+              agentPoolId: ${"hydrate-" + string(disk.id)}
+            auth:
+              type: OAuth2
+              scope: "https://www.googleapis.com/auth/cloud-platform"
+            timeout: 180
+          result: pool
+        retry: ${http.default_retry_non_idempotent}
+    - create_sts_agent_vm:
+        try:
+          call: googleapis.compute.v1.instances.insert
+          args:
+            project: ${project}
+            zone: ${zone}
+            requestId: ${uuid}
+            sourceInstanceTemplate: ${"projects/"+ project + "/global/instanceTemplates/sts-agent"}
+            body:
+              name: ${"hydrate-" + string(disk.id)}
+              deletionProtection: false
+              disks:
+                - autoDelete: true
+                  boot: true
+                  mode: "READ_WRITE"
+                  initializeParams:
+                    sourceImage: "projects/cos-cloud/global/images/family/cos-stable"
+                  type: "PERSISTENT"
+                - autoDelete: false
+                  boot: false
+                  mode: "READ_WRITE"
+                  deviceName: "hydrate-pd"
+                  source: ${disk.selfLink}
+                  type: "PERSISTENT"
+          result: vm
+        retry: ${http.default_retry}
+        except:
+          as: e
+          steps:
+            - save_instance_insert_error:
+                assign:
+                  - status:
+                      code: 500
+                      message: ${e}
+                next: do_exit
+    - insert_sts_job:
+        try:
+          call: http.post
+          args:
+            url: "https://storagetransfer.googleapis.com/v1/transferJobs"
+            body:
+              projectId: ${project}
+              transferSpec:
+                sinkAgentPoolName: ${pool.body.name}
+                posixDataSink:
+                  rootDirectory: ${"/mnt/disks/hydrate-pd/" + pd_path}
+                gcsDataSource:
+                  bucketName: ${bucket}
+                  path: ${bucket_path}
+                transferOptions:
+                  overwriteWhen: "DIFFERENT"
+              status: "ENABLED"
+            auth:
+              type: OAuth2
+              scope: "https://www.googleapis.com/auth/cloud-platform"
+            timeout: 180
+          result: sts_job
+        retry: ${http.default_retry_non_idempotent}
+        except:
+          as: e
+          steps:
+            - save_sts_job_insert_error:
+                assign:
+                  - status:
+                      code: 500
+                      message: ${e}
+                next: do_exit
+    - run_sts_job:
+        try:
+          call: googleapis.storagetransfer.v1.transferJobs.run
+          args:
+            jobName: ${sts_job.body.name}
+            body:
+              projectId: ${project}
+            connector_params:
+              timeout: 21600 # 6 hours
+              initial_delay: 15
+              skip_polling: false
+          result: sts_operation
+        retry: ${http.default_retry_non_idempotent}
+        except:
+          as: e
+          steps:
+            - save_sts_job_run_error:
+                assign:
+                  - status:
+                      code: 500
+                      message: ${e}
+                next: do_exit
+    - process_sts_operation:
+        steps:
+          - log_operation:
+              call: sys.log
+              args:
+                severity: "DEBUG"
+                json: ${sts_operation}
+          - process_operation:
+              switch:
+                - condition: ${map.get(sts_operation, ["metadata", "status"]) != "SUCCESS"}
+                  steps:
+                    - sts_failed:
+                        assign:
+                          - status:
+                              code: 500
+                              message:
+                                message: "Hydration failed."
+                                errorBreakdowns: ${sts_operation.metadata.errorBreakdowns}
+                - condition: true
+                  steps:
+                    - sts_succeeded:
+                        assign:
+                          - status:
+                              code: 200
+                              message: "SUCCESS"
+                              stats: ${sts_operation.metadata.counters}
+    - do_exit:
+        steps:
+          - control_cleanup:
+              next: cleanup_sts_job
+          - cleanup_sts_job:
+              switch:
+                - condition: ${sts_job != null}
+                  call: googleapis.storagetransfer.v1.transferJobs.patch
+                  args:
+                    jobName: ${sts_job.body.name}
+                    body:
+                      projectId: ${project}
+                      transferJob:
+                        status: "DELETED"
+          - cleanup_vm:
+              switch:
+                - condition: ${vm != null}
+                  try:
+                    call: googleapis.compute.v1.instances.delete
+                    args:
+                      instance: ${"hydrate-" + string(disk.id)}
+                      project: ${project}
+                      zone: ${zone}
+                  retry: ${http.default_retry_non_idempotent}
+          - cleanup_sts_pool:
+              switch:
+                - condition: ${pool != null}
+                  try:
+                    call: http.delete
+                    args:
+                      url: ${"https://storagetransfer.googleapis.com/v1/projects/" + project + "/agentPools/hydrate-" + string(disk.id)}
+                      auth:
+                        type: OAuth2
+                        scope: "https://www.googleapis.com/auth/cloud-platform"
+                      timeout: 180
+                  retry: ${http.default_retry_non_idempotent}
+          - return_status:
+              switch:
+                - condition: ${status.code != 200}
+                  raise: ${status.message}
+                - condition: true
+                  return:
+                    code: ${status.code}
+                    message: ${status.message}
+
+disks_get:
+  params: [name, project, zone]
+  steps:
+    - do_disk_get:
+        call: googleapis.compute.v1.disks.get
+        args:
+          disk: ${name}
+          project: ${project}
+          zone: ${zone}
+        result: disk
+    - disks_return:
+        return: ${disk}

@@ -1,0 +1,149 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+users:
+  - name: hydrator
+    uid: 2000
+
+# run every time, per
+# https://cloud.google.com/container-optimized-os/docs/how-to/create-configure-instance#using_cloud-init_with_the_cloud_config_format
+write_files:
+  - path: /mnt/stateful_partition/hydrator/mount-disk.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      MOUNT_PATH="${MOUNT_PATH}"
+      DEVICE="/dev/disk/by-id/google-${PD_DISK_NAME}"
+
+      if [[ ! -e "$DEVICE" ]] ; then
+        echo "Aborting. PD '$DEVICE' does not exist."
+        exit 1
+      fi
+
+      if ! tune2fs -l "$DEVICE" ; then
+        echo "Formatting '$DEVICE'"
+        mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEVICE"
+      else
+        echo "Device '$DEVICE' already formatted"
+      fi
+
+      mkdir -p "$MOUNT_PATH"
+      echo "Mounting '$DEVICE' at '$MOUNT_PATH'"
+      mount -o discard,defaults "$DEVICE" "$MOUNT_PATH"
+
+  - path: /etc/systemd/system/hydrator-mount-disk.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=Mounts PD to be hydrated
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash /mnt/stateful_partition/hydrator/mount-disk.sh
+
+  - path: /mnt/stateful_partition/hydrator/download-agent-credentials.sh
+    permissions: "0755"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      function get_metadata_value() {
+        curl --retry 5 -s -f -H \
+          "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/$1"
+      }
+
+      function get_access_token() {
+        get_metadata_value "instance/service-accounts/default/token" \
+          | awk -F\" '{ print $4 }'
+      }
+
+      function get_secret_version() {
+        local project="$1"
+        local secret="$2"
+        local version="$3"
+        local token
+        token=$(get_access_token)
+
+        curl --retry 5 -s -f \
+          --header "authorization: Bearer $token" \
+          --header "content-type: application/json" \
+          "https://secretmanager.googleapis.com/v1/projects/$project/secrets/$secret/versions/$version:access" \
+          | jq -r ".payload.data" | base64 --decode
+      }
+
+      SECRET=$(get_secret_version "${SECRET_PROJECT}" "${SECRET_ID}" "latest")
+      errcode=$?
+      if (( $errcode != 0 )); then
+        SA_EMAIL=$(get_metadata_value "instance/service-accounts/default/email")
+        echo "Failed to acquire STS agent credentials.""
+        echo "Ensure that $SA_EMAIL has been granted 'roles/secretmanager.secretAccessor'""
+        echo "on secret '${SECRET_ID}' in project '${SECRET_PROJECT}'"
+        exit $errcode
+      fi
+      mkdir -p /var/run/hydrator
+      echo "$SECRET" > /var/run/hydrator/agent-credentials.json
+
+  - path: /etc/systemd/system/download-agent-credentials.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Requires=network-online.target
+      After=network-online.target
+      Description=Download STS Agent Credentials from Secrets Manager
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash /mnt/stateful_partition/hydrator/download-agent-credentials.sh
+
+  - path: /mnt/stateful_partition/hydrator/start-sts-agent.sh
+    permissions: "0644"
+    owner: root
+    content: |
+      #!/bin/bash
+      set -uo pipefail
+
+      /usr/bin/docker run --ulimit memlock=64000000 --rm \
+        -v ${MOUNT_PATH}:${MOUNT_PATH} \
+        -v /var/run/hydrator/agent-credentials.json:/var/run/hydrator/agent-credentials.json \
+        gcr.io/cloud-ingest/tsop-agent:latest \
+        --project-id="${PROJECT_ID}" \
+        --creds-file=/var/run/hydrator/agent-credentials.json \
+        --hostname="$(hostname)" \
+        --agent-pool="$(hostname)"
+
+  - path: /etc/systemd/system/hydrator-sts-agent.service
+    permissions: "0644"
+    owner: root
+    content: |
+      [Unit]
+      Description=STS Service agent container
+      Requires=download-agent-credentials.service hydrator-mount-disk.service docker.service
+      After=download-agent-credentials.service hydrator-mount-disk.service docker.service
+
+      [Service]
+      ExecStart=/bin/bash /mnt/stateful_partition/hydrator/start-sts-agent.sh
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl start hydrator-mount-disk.service
+  - systemctl start download-agent-credentials.service
+  - systemctl start hydrator-sts-agent.service
